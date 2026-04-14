@@ -705,11 +705,17 @@ def build_dataset(
     rows: List[Dict[str, str]] = []
     seen_questions = set()
     completed_chapters = set()
+    chapter_row_counts: Dict[str, int] = {}
     if resume:
         rows, seen_questions, completed_chapters = load_checkpoint(checkpoint_path)
         print(
             f"ℹ️ Resume enabled: existing rows={len(rows)}, completed chapters={len(completed_chapters)}"
         )
+
+    for r in rows:
+        chapter_name = clean_text(str(r.get("chapter", "")))
+        if chapter_name:
+            chapter_row_counts[chapter_name] = chapter_row_counts.get(chapter_name, 0) + 1
 
     print(f"মোট অধ্যায় ধরা পড়েছে: {len(chapters)}")
     print(f"ব্যবহারযোগ্য অধ্যায়: {len(usable_chapters)}")
@@ -719,18 +725,30 @@ def build_dataset(
 
     for chapter_idx, chapter in enumerate(tqdm(selected_chapters, desc="Chapters"), start=start_index + 1):
         chapter_key = f"{chapter_idx}:{chapter.start_page}:{chapter.end_page}:{chapter.title}"
-        if chapter_key in completed_chapters:
+        existing_for_chapter = chapter_row_counts.get(chapter.title, 0)
+
+        # Treat a chapter as truly completed only if it already reached the current target.
+        if existing_for_chapter >= questions_per_chapter:
+            if chapter_key not in completed_chapters:
+                completed_chapters.add(chapter_key)
+                save_checkpoint(checkpoint_path, rows, seen_questions, completed_chapters)
             continue
+
+        if chapter_key in completed_chapters:
+            completed_chapters.discard(chapter_key)
+            save_checkpoint(checkpoint_path, rows, seen_questions, completed_chapters)
 
         chapter_text = clean_text(chapter.text)
         if len(chapter_text) < min_chapter_chars:
-            completed_chapters.add(chapter_key)
+            # Keep as pending so later runs can retry if parameters change.
+            completed_chapters.discard(chapter_key)
             save_checkpoint(checkpoint_path, rows, seen_questions, completed_chapters)
             continue
 
         chunks = split_chunks(chapter_text, chunk_size=chunk_size, overlap=chunk_overlap)
         if not chunks:
-            completed_chapters.add(chapter_key)
+            # Keep as pending so later runs can retry if parameters change.
+            completed_chapters.discard(chapter_key)
             save_checkpoint(checkpoint_path, rows, seen_questions, completed_chapters)
             continue
 
@@ -746,17 +764,18 @@ def build_dataset(
 
         try:
             chapter_kept = 0
+            remaining_needed = max(0, questions_per_chapter - existing_for_chapter)
 
             for batch in chunk_batches:
-                if chapter_kept >= questions_per_chapter:
+                if chapter_kept >= remaining_needed:
                     break
 
-                remaining = questions_per_chapter - chapter_kept
+                remaining = remaining_needed - chapter_kept
                 req_pairs = min(max(1, qa_pairs_per_call), max(1, remaining + 1))
                 qa_pairs = qa_model.generate_qa_pairs_from_chunks(chapter.title, batch, req_pairs)
 
                 for qa in qa_pairs:
-                    if chapter_kept >= questions_per_chapter:
+                    if chapter_kept >= remaining_needed:
                         break
 
                     question = clean_text(qa.get("question", ""))
@@ -779,11 +798,17 @@ def build_dataset(
 
                     rows.append({"question": question, "answer": answer, "chapter": chapter.title})
                     seen_questions.add(q_norm)
+                    chapter_row_counts[chapter.title] = chapter_row_counts.get(chapter.title, 0) + 1
                     chapter_kept += 1
         except Exception as chapter_exc:
             print(f"⚠️ chapter #{chapter_idx} প্রসেসে ত্রুটি, skip করা হলো: {chapter_exc}")
 
-        completed_chapters.add(chapter_key)
+        final_for_chapter = chapter_row_counts.get(chapter.title, 0)
+        if final_for_chapter >= questions_per_chapter:
+            completed_chapters.add(chapter_key)
+        else:
+            completed_chapters.discard(chapter_key)
+
         save_checkpoint(checkpoint_path, rows, seen_questions, completed_chapters)
 
     if not rows:
